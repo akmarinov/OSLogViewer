@@ -34,6 +34,14 @@ public struct OSLogViewer: View {
     private var selectedSubsystems: Set<String>
 
     @State
+    /// Selected category filters mapped per subsystem
+    private var selectedCategoriesBySubsystem: [String: Set<String>] = [:]
+
+    @State
+    /// Available categories discovered in the loaded logs, keyed by subsystem
+    private var availableCategoriesBySubsystem: [String: [String]] = [:]
+
+    @State
     /// Available subsystems discovered in the loaded logs
     private var availableSubsystems: [String] = []
 
@@ -114,6 +122,9 @@ public struct OSLogViewer: View {
                 subsystemFilterMenu
             }
             ToolbarItem {
+                categoryFilterMenu
+            }
+            ToolbarItem {
                 if #available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *) {
                     ShareLink(
                         items: export()
@@ -127,6 +138,9 @@ public struct OSLogViewer: View {
             ToolbarItem(placement: .navigationBarLeading) {
                 subsystemFilterMenu
             }
+            ToolbarItem(placement: .navigationBarLeading) {
+                categoryFilterMenu
+            }
             ToolbarItem(placement: .navigationBarTrailing) {
                 if #available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *) {
                     ShareLink(
@@ -138,6 +152,9 @@ public struct OSLogViewer: View {
                 }
             }
 #else
+            ToolbarItem {
+                categoryFilterMenu
+            }
             ToolbarItem {
                 if #available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *) {
                     ShareLink(
@@ -200,12 +217,23 @@ public struct OSLogViewer: View {
         }
     }
 
-    private var displayedLogMessages: [OSLogEntryLog] {
-        guard !selectedSubsystems.isEmpty else {
-            return logMessages
+    private var effectiveSubsystemFilters: Set<String> {
+        if !selectedSubsystems.isEmpty {
+            return selectedSubsystems
         }
 
-        return logMessages.filter { selectedSubsystems.contains($0.subsystem) }
+        return selectedCategoriesBySubsystem.reduce(into: Set<String>()) { partialResult, element in
+            guard !element.value.isEmpty else { return }
+            partialResult.insert(element.key)
+        }
+    }
+
+    private var displayedLogMessages: [OSLogEntryLog] {
+        FilterSupport.filterEntries(
+            logMessages,
+            subsystemFilters: effectiveSubsystemFilters,
+            categoryFilters: selectedCategoriesBySubsystem
+        )
     }
 
     private var canExport: Bool {
@@ -213,38 +241,158 @@ public struct OSLogViewer: View {
     }
 
     private var filterOverlayDescription: String {
-        let targets = selectedSubsystems.sorted()
-        if let formatted = ListFormatter().string(from: targets) {
-            return "No log entries match \(formatted). Adjust your filters or pull to refresh."
+        let subsystemFilters = effectiveSubsystemFilters
+        let subsystemSummary = subsystemSummaryDescription(for: subsystemFilters)
+        let categoryParts = categoryFilterSummaryParts
+
+        if categoryParts.isEmpty {
+            if subsystemFilters.isEmpty {
+                return "No log entries match the current filters. Adjust your filters or pull to refresh."
+            }
+
+            return "No log entries match \(subsystemSummary). Adjust your filters or pull to refresh."
         }
 
-        return "No log entries match the selected subsystem filters. Adjust your filters or pull to refresh."
+        if categoryParts.count == 1 {
+            return "No log entries match \(subsystemSummary) with categories \(categoryParts[0]). Adjust your filters or pull to refresh."
+        }
+
+        let categoriesSummary = categoryParts.joined(separator: "; ")
+        return "No log entries match \(subsystemSummary) with the selected categories (\(categoriesSummary)). Adjust your filters or pull to refresh."
     }
 
     private var filterMenuLabel: String {
-        guard !selectedSubsystems.isEmpty else {
+        let filters = effectiveSubsystemFilters
+        guard !filters.isEmpty else {
             return "All subsystems"
         }
 
-        let targets = selectedSubsystems.sorted()
-        if let formatted = ListFormatter().string(from: targets) {
-            return formatted
-        }
-
-        return targets.joined(separator: ", ")
+        return displayString(for: filters.sorted())
     }
 
-    private func formattedFilterSummary(for filters: Set<String>) -> String {
+    private func filterSummaryDescription() -> String {
+        let subsystemFilters = effectiveSubsystemFilters
+        let subsystemText: String
+
+        if subsystemFilters.isEmpty {
+            subsystemText = "All subsystems"
+        } else {
+            subsystemText = displayString(for: subsystemFilters.sorted())
+        }
+
+        let categoryEntries = activeCategoryFilters
+        guard !categoryEntries.isEmpty else {
+            return "Filters: \(subsystemText)"
+        }
+
+        let categoryDescriptions = categoryEntries.compactMap { entry -> String? in
+            let categories = normalizedCategories(from: Array(entry.categories)).map(categoryDisplayName)
+            guard !categories.isEmpty else { return nil }
+
+            let categoryList = displayString(for: categories)
+            if categoryEntries.count == 1 && subsystemFilters.count <= 1 {
+                return categoryList
+            }
+
+            return "\(categoryList) in \(entry.subsystem)"
+        }
+
+        guard !categoryDescriptions.isEmpty else {
+            return "Filters: \(subsystemText)"
+        }
+
+        let categoriesText = categoryDescriptions.joined(separator: "; ")
+        return "Filters: \(subsystemText); Categories: \(categoriesText)"
+    }
+
+    private func normalizedCategories(from categories: [String]) -> [String] {
+        FilterSupport.normalizedCategories(from: categories)
+    }
+
+    private func sanitizeCategorySelections(
+        currentSelections: [String: Set<String>],
+        availableCategories: [String: [String]]
+    ) -> [String: Set<String>] {
+        FilterSupport.sanitizeCategorySelections(
+            currentSelections: currentSelections,
+            availableCategories: availableCategories
+        )
+    }
+
+    private func subsystemSummaryDescription(for filters: Set<String>) -> String {
         guard !filters.isEmpty else {
-            return "Filters: All subsystems"
+            return "any subsystem"
         }
 
-        let targets = filters.sorted()
-        if let formatted = ListFormatter().string(from: targets) {
-            return "Filters: \(formatted)"
+        let list = displayString(for: filters.sorted())
+        if filters.count == 1 {
+            return "subsystem \(list)"
         }
 
-        return "Filters: \(targets.joined(separator: ", "))"
+        return "subsystems \(list)"
+    }
+
+    private func displayString(for items: [String]) -> String {
+        FilterSupport.displayString(for: items)
+    }
+
+    private func categoryDisplayName(for category: String) -> String {
+        FilterSupport.categoryDisplayName(for: category)
+    }
+
+    private var activeCategoryFilters: [(subsystem: String, categories: Set<String>)] {
+        selectedCategoriesBySubsystem
+            .compactMap { pair -> (subsystem: String, categories: Set<String>)? in
+                let (subsystem, categories) = pair
+                guard !categories.isEmpty else { return nil }
+                return (subsystem: subsystem, categories: categories)
+            }
+            .sorted { lhs, rhs in
+                lhs.subsystem.localizedCaseInsensitiveCompare(rhs.subsystem) == .orderedAscending
+            }
+    }
+
+    private var categoryFilterSummaryParts: [String] {
+        let entries = activeCategoryFilters
+        guard !entries.isEmpty else { return [] }
+
+        let includeSubsystemName = entries.count > 1 || effectiveSubsystemFilters.count > 1
+
+        return entries.compactMap { entry -> String? in
+            let categories = normalizedCategories(from: Array(entry.categories)).map(categoryDisplayName)
+            guard !categories.isEmpty else { return nil }
+
+            let list = displayString(for: categories)
+            if includeSubsystemName {
+                return "\(list) (\(entry.subsystem))"
+            }
+
+            return list
+        }
+    }
+
+    private var categoryFilterMenuLabel: String {
+        let entries = activeCategoryFilters
+        guard !entries.isEmpty else { return "All categories" }
+
+        if entries.count == 1, let entry = entries.first {
+            let categories = normalizedCategories(from: Array(entry.categories)).map(categoryDisplayName)
+            if categories.isEmpty {
+                return "All categories"
+            }
+
+            if categories.count <= 2 {
+                return displayString(for: categories)
+            }
+
+            return "Categories (\(categories.count))"
+        }
+
+        let totalCount = entries.reduce(into: 0) { partialResult, element in
+            partialResult += element.categories.count
+        }
+
+        return "Categories (\(totalCount))"
     }
 
     private var subsystemFilterMenu: some View {
@@ -258,15 +406,16 @@ public struct OSLogViewer: View {
                     } label: {
                         Label(
                             subsystem,
-                            systemImage: selectedSubsystems.contains(subsystem) ? "checkmark.circle.fill" : "circle"
+                            systemImage: isSubsystemActive(subsystem) ? "checkmark.circle.fill" : "circle"
                         )
                     }
                 }
 
-                if !selectedSubsystems.isEmpty {
+                if !selectedSubsystems.isEmpty || !selectedCategoriesBySubsystem.isEmpty {
                     Divider()
                     Button("Show all subsystems") {
                         selectedSubsystems.removeAll()
+                        selectedCategoriesBySubsystem.removeAll()
                     }
                 }
             }
@@ -276,14 +425,118 @@ public struct OSLogViewer: View {
         .disabled(availableSubsystems.isEmpty)
     }
 
+    private var categoryFilterMenu: some View {
+        Menu {
+            let candidateSubsystems = Set(availableSubsystems)
+                .union(availableCategoriesBySubsystem.keys)
+                .union(selectedCategoriesBySubsystem.keys)
+                .filter { !$0.isEmpty }
+                .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+
+            let subsForCategories = candidateSubsystems.filter { subsystem in
+                let categories = availableCategoriesBySubsystem[subsystem] ?? []
+                let selection = selectedCategoriesBySubsystem[subsystem] ?? Set<String>()
+                return !categories.isEmpty || !selection.isEmpty
+            }
+
+            if subsForCategories.isEmpty {
+                Text("No categories detected yet")
+            } else {
+                ForEach(subsForCategories, id: \.self) { subsystem in
+                    let categories = availableCategoriesBySubsystem[subsystem] ?? []
+                    let selection = selectedCategoriesBySubsystem[subsystem] ?? Set<String>()
+
+                    if subsForCategories.count > 1 {
+                        Section(subsystem) {
+                            categoryMenuItems(for: subsystem, availableCategories: categories, selection: selection)
+                        }
+                    } else {
+                        categoryMenuItems(for: subsystem, availableCategories: categories, selection: selection)
+                    }
+                }
+
+                if !selectedCategoriesBySubsystem.isEmpty {
+                    Divider()
+                    Button("Reset category filters") {
+                        selectedCategoriesBySubsystem.removeAll()
+                    }
+                }
+            }
+        } label: {
+            Label(categoryFilterMenuLabel, systemImage: "square.grid.3x3")
+        }
+        .disabled(availableCategoriesBySubsystem.isEmpty && selectedCategoriesBySubsystem.isEmpty)
+    }
+
+    @ViewBuilder
+    private func categoryMenuItems(
+        for subsystem: String,
+        availableCategories: [String],
+        selection: Set<String>
+    ) -> some View {
+        let combined = normalizedCategories(from: availableCategories + Array(selection))
+
+        if combined.isEmpty {
+            Text("No categories detected yet")
+        } else {
+            ForEach(combined, id: \.self) { category in
+                Button {
+                    toggleCategory(category, for: subsystem)
+                } label: {
+                    Label(
+                        categoryDisplayName(for: category),
+                        systemImage: isCategorySelected(category, for: subsystem) ? "checkmark.circle.fill" : "circle"
+                    )
+                }
+            }
+        }
+
+        if !selection.isEmpty {
+            Divider()
+            Button("Show all categories") {
+                clearCategories(for: subsystem)
+            }
+        }
+    }
+
     private func toggleSubsystem(_ subsystem: String) {
         guard !subsystem.isEmpty else { return }
 
         if selectedSubsystems.contains(subsystem) {
             selectedSubsystems.remove(subsystem)
+            selectedCategoriesBySubsystem.removeValue(forKey: subsystem)
         } else {
             selectedSubsystems.insert(subsystem)
         }
+    }
+
+    private func toggleCategory(_ category: String, for subsystem: String) {
+        guard !subsystem.isEmpty else { return }
+
+        var categories = selectedCategoriesBySubsystem[subsystem] ?? Set<String>()
+        if categories.contains(category) {
+            categories.remove(category)
+        } else {
+            categories.insert(category)
+        }
+
+        if categories.isEmpty {
+            selectedCategoriesBySubsystem.removeValue(forKey: subsystem)
+        } else {
+            selectedCategoriesBySubsystem[subsystem] = categories
+        }
+    }
+
+    private func clearCategories(for subsystem: String) {
+        selectedCategoriesBySubsystem.removeValue(forKey: subsystem)
+    }
+
+    private func isSubsystemActive(_ subsystem: String) -> Bool {
+        selectedSubsystems.contains(subsystem) || (selectedCategoriesBySubsystem[subsystem]?.isEmpty == false)
+    }
+
+    private func isCategorySelected(_ category: String, for subsystem: String) -> Bool {
+        selectedCategoriesBySubsystem[subsystem]?.contains(category) ?? false
     }
 
     private func resolvedAppName() -> String {
@@ -332,7 +585,7 @@ public struct OSLogViewer: View {
         let headerLines = [
             "OSLog archive for \(appName)",
             "Generated on \(Date().formatted(date: .long, time: .standard))",
-            formattedFilterSummary(for: selectedSubsystems),
+            filterSummaryDescription(),
             "Logs captured since \(since.formatted(date: .abbreviated, time: .shortened))",
             ""
         ]
@@ -463,10 +716,35 @@ public struct OSLogViewer: View {
                     /// Remap from `AnySequence<OSLogEntry>` to type `[OSLogEntryLog]`
                     logMessages = allEntries
 
-                    let combinedSubsystems = detectedSubsystems
+                    var categoriesBySubsystem = Dictionary(grouping: allEntries, by: \.subsystem)
+                        .mapValues { entries in
+                            normalizedCategories(from: entries.map(\.category))
+                        }
+
+                    let prioritizedSubsystems = detectedSubsystems
                         .union(defaultSubsystems)
                         .union(selectedSubsystems)
+                        .union(Set(selectedCategoriesBySubsystem.keys))
                         .filter { !$0.isEmpty }
+
+                    for subsystem in prioritizedSubsystems where categoriesBySubsystem[subsystem] == nil {
+                        categoriesBySubsystem[subsystem] = []
+                    }
+
+                    for (subsystem, selectedCategories) in selectedCategoriesBySubsystem {
+                        let merged = Set(categoriesBySubsystem[subsystem] ?? [])
+                            .union(selectedCategories)
+                        categoriesBySubsystem[subsystem] = normalizedCategories(from: Array(merged))
+                    }
+
+                    availableCategoriesBySubsystem = categoriesBySubsystem
+
+                    selectedCategoriesBySubsystem = sanitizeCategorySelections(
+                        currentSelections: selectedCategoriesBySubsystem,
+                        availableCategories: categoriesBySubsystem
+                    )
+
+                    let combinedSubsystems = prioritizedSubsystems
                         .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
 
                     availableSubsystems = combinedSubsystems
