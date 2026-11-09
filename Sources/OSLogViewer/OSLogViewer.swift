@@ -49,6 +49,21 @@ public struct OSLogViewer: View {
     /// This variable saves the current state
     private var finishedCollecting: Bool = false
 
+    /// How much history is kept; older entries beyond these limits are omitted
+    private let limits: OSLogCollectionLimits
+
+    @State
+    /// Number of older entries dropped to stay within `limits`
+    private var omittedCount: Int = 0
+
+    @State
+    /// Incremented after every collection so the export is rebuilt
+    private var collectionGeneration: Int = 0
+
+    @State
+    /// The prepared export file, written in the background
+    private var exportURL: URL?
+
     /// OSLogViewer is made for viewing your apps OS_Log history,
     /// it is a SwiftUI view which can be used in your app to view and export your logs.
     ///
@@ -56,13 +71,16 @@ public struct OSLogViewer: View {
     ///   - subsystem: which subsystem should be read
     ///   - additionalSubsystems: any other subsystems to pre-select
     ///   - since: from which time (standard 1hr)
+    ///   - limits: how much history is kept (standard 20,000 entries / 8 MB)
     public init(
         subsystem: String = Bundle.main.bundleIdentifier ?? "",
         additionalSubsystems: Set<String> = [],
-        since: Date = Date().addingTimeInterval(-3600)
+        since: Date = Date().addingTimeInterval(-3600),
+        limits: OSLogCollectionLimits = .standard
     ) {
         self.subsystem = subsystem
         self.since = since
+        self.limits = limits
 
         var combinedSubsystems = additionalSubsystems
         if !subsystem.isEmpty {
@@ -82,16 +100,18 @@ public struct OSLogViewer: View {
     /// Convenience initializer that accepts a set of subsystems.
     public init(
         subsystems: Set<String>,
-        since: Date = Date().addingTimeInterval(-3600)
+        since: Date = Date().addingTimeInterval(-3600),
+        limits: OSLogCollectionLimits = .standard
     ) {
         if let first = subsystems.first {
             self.init(
                 subsystem: first,
                 additionalSubsystems: subsystems.subtracting(Set([first])),
-                since: since
+                since: since,
+                limits: limits
             )
         } else {
-            self.init(subsystem: "", since: since)
+            self.init(subsystem: "", since: since, limits: limits)
         }
     }
 
@@ -99,6 +119,11 @@ public struct OSLogViewer: View {
     public var body: some View {
         VStack {
             List {
+                if omittedCount > 0 {
+                    Text("Showing the newest \(logMessages.count) entries. \(omittedCount) older entries were omitted.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 ForEach(displayedLogMessages, id: \.self) { entry in
                     VStack {
                         // Actual log message
@@ -125,14 +150,7 @@ public struct OSLogViewer: View {
                 categoryFilterMenu
             }
             ToolbarItem {
-                if #available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *) {
-                    ShareLink(
-                        items: export()
-                    ) {
-                        Label("Share", systemImage: "square.and.arrow.up")
-                    }
-                    .disabled(!canExport)
-                }
+                shareButton
             }
 #elseif !os(tvOS) && !os(watchOS)
             ToolbarItem(placement: .navigationBarLeading) {
@@ -142,28 +160,14 @@ public struct OSLogViewer: View {
                 categoryFilterMenu
             }
             ToolbarItem(placement: .navigationBarTrailing) {
-                if #available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *) {
-                    ShareLink(
-                        items: export()
-                    ) {
-                        Label("Share", systemImage: "square.and.arrow.up")
-                    }
-                    .disabled(!canExport)
-                }
+                shareButton
             }
 #else
             ToolbarItem {
                 categoryFilterMenu
             }
             ToolbarItem {
-                if #available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *) {
-                    ShareLink(
-                        items: export()
-                    ) {
-                        Label("Share", systemImage: "square.and.arrow.up")
-                    }
-                    .disabled(!canExport)
-                }
+                shareButton
             }
 #endif
         }
@@ -215,6 +219,35 @@ public struct OSLogViewer: View {
                 await getLog()
             }
         }
+        .task(id: exportRequest) {
+            await prepareExport()
+        }
+    }
+
+    @ViewBuilder
+    private var shareButton: some View {
+        if #available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *), let exportURL {
+            ShareLink(item: exportURL) {
+                Label("Share", systemImage: "square.and.arrow.up")
+            }
+        } else {
+            Label("Share", systemImage: "square.and.arrow.up")
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private struct ExportRequest: Hashable {
+        let generation: Int
+        let subsystems: Set<String>
+        let categories: [String: Set<String>]
+    }
+
+    private var exportRequest: ExportRequest {
+        ExportRequest(
+            generation: collectionGeneration,
+            subsystems: effectiveSubsystemFilters,
+            categories: selectedCategoriesBySubsystem
+        )
     }
 
     private var effectiveSubsystemFilters: Set<String> {
@@ -574,42 +607,62 @@ public struct OSLogViewer: View {
         return sanitized.isEmpty ? "OSLogViewer" : sanitized
     }
 
-    @available(iOS 17.0, macOS 14.0, watchOS 10.0, tvOS 17.0, *)
-    private func export() -> [URL] {
-        guard !displayedLogMessages.isEmpty else { return [] }
+    /// Write the currently displayed entries to a file off the main thread.
+    private func prepareExport() async {
+        let previousURL = exportURL
+        exportURL = nil
+        if let previousURL {
+            try? FileManager.default.removeItem(at: previousURL)
+        }
+        guard canExport else { return }
 
         let appName = resolvedAppName()
         let fileName = exportFileName(for: appName)
-        let exportURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
-
-        let headerLines = [
+        var headerLines = [
             "OSLog archive for \(appName)",
             "Generated on \(Date().formatted(date: .long, time: .standard))",
             filterSummaryDescription(),
-            "Logs captured since \(since.formatted(date: .abbreviated, time: .shortened))",
-            ""
+            "Logs captured since \(since.formatted(date: .abbreviated, time: .shortened))"
         ]
-
-        let body = displayedLogMessages.map { entry -> String in
-            let timestamp = entry.date.formatted(date: .abbreviated, time: .standard)
-            let headline = "[\(timestamp)] \(getLogLevelEmoji(level: entry.level)) \(entry.composedMessage)"
-            let metadata = "sender: \(entry.sender) | subsystem: \(entry.subsystem) | category: \(entry.category)"
-            return headline + "\r\n" + metadata
+        if omittedCount > 0 {
+            headerLines.append("Omitted \(omittedCount) older entries (limit \(limits.maxEntries) entries / \(limits.maxBytes / 1024) KB)")
         }
-        .joined(separator: "\r\n\r\n")
+        let entries = displayedLogMessages
 
-        let fileContents = headerLines.joined(separator: "\r\n") + body + "\r\n"
+        let url = await Task.detached(priority: .utility) {
+            Self.writeArchive(fileName: fileName, headerLines: headerLines, entries: entries)
+        }.value
+
+        guard !Task.isCancelled else {
+            if let url { try? FileManager.default.removeItem(at: url) }
+            return
+        }
+        exportURL = url
+    }
+
+    nonisolated private static func writeArchive(fileName: String, headerLines: [String], entries: [OSLogEntryLog]) -> URL? {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OSLogViewer-\(UUID().uuidString)", isDirectory: true)
+        let exportURL = directory.appendingPathComponent(fileName)
+
+        var data = Data()
+        data.reserveCapacity(entries.reduce(1024) { $0 + OSLogCollection.cost(of: $1) + 96 })
+        data.append(contentsOf: (headerLines.joined(separator: "\r\n") + "\r\n").utf8)
+        for (index, entry) in entries.enumerated() {
+            if index > 0 { data.append(contentsOf: "\r\n\r\n".utf8) }
+            let timestamp = entry.date.formatted(date: .abbreviated, time: .standard)
+            data.append(contentsOf: "[\(timestamp)] \(levelEmoji(entry.level)) \(entry.composedMessage)\r\n".utf8)
+            data.append(contentsOf: "sender: \(entry.sender) | subsystem: \(entry.subsystem) | category: \(entry.category)".utf8)
+        }
+        data.append(contentsOf: "\r\n".utf8)
 
         do {
-            if FileManager.default.fileExists(atPath: exportURL.path) {
-                try FileManager.default.removeItem(at: exportURL)
-            }
-
-            try fileContents.write(to: exportURL, atomically: true, encoding: .utf8)
-            return [exportURL]
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: exportURL, options: .atomic)
+            return exportURL
         } catch {
             os_log(.fault, "Failed to write log archive: %@", error as NSError)
-            return []
+            return nil
         }
     }
 
@@ -639,6 +692,10 @@ public struct OSLogViewer: View {
     /// - Parameter level: log level
     /// - Returns: Emoji
     func getLogLevelEmoji(level: OSLogEntryLog.Level) -> String {
+        Self.levelEmoji(level)
+    }
+
+    nonisolated static func levelEmoji(_ level: OSLogEntryLog.Level) -> String {
         switch level {
         case .undefined, .notice:
             "🔔"
@@ -694,17 +751,13 @@ public struct OSLogViewer: View {
 
         DispatchQueue.global(qos: .background).async {
             do {
-                /// Initialize logstore for the current process
-                let logStore = try OSLogStore(scope: .currentProcessIdentifier)
-
-                /// Fetch all logs since a specific date
-                let sinceDate = logStore.position(date: since)
-
-                /// Fetch all logs; filtering happens in-memory so multiple subsystems can be combined
-                let allEntries = try logStore.getEntries(
-                    at: sinceDate,
-                    matching: NSPredicate(value: true)
-                ).compactMap { $0 as? OSLogEntryLog }
+                /// Fetch the newest logs within `limits`; filtering happens in-memory so multiple subsystems can be combined
+                let collection = try OSLogCollection.collect(
+                    since: since,
+                    matching: NSPredicate(value: true),
+                    limits: limits
+                )
+                let allEntries = collection.entries
 
                 let detectedSubsystems = Set(
                     allEntries
@@ -713,8 +766,8 @@ public struct OSLogViewer: View {
                 )
 
                 DispatchQueue.main.async {
-                    /// Remap from `AnySequence<OSLogEntry>` to type `[OSLogEntryLog]`
                     logMessages = allEntries
+                    omittedCount = collection.omittedCount
 
                     var categoriesBySubsystem = Dictionary(grouping: allEntries, by: \.subsystem)
                         .mapValues { entries in
@@ -757,6 +810,7 @@ public struct OSLogViewer: View {
             DispatchQueue.main.async {
                 // We've finished collecting
                 finishedCollecting = true
+                collectionGeneration += 1
             }
         }
     }

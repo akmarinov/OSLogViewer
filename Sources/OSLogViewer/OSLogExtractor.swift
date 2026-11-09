@@ -24,23 +24,32 @@ public class OSLogExtractor {
     /// From which date preriod
     public var since: Date
 
+    /// How much history is kept; older entries beyond these limits are omitted
+    public var limits: OSLogCollectionLimits
+
     /// OSLogExtractor is made to extract your apps OS_Log history,
     ///
     /// - Parameters:
     ///   - subsystem: which subsystem should be read
     ///   - since: from which time (standard 1hr)
+    ///   - limits: how much history is kept (standard 20,000 entries / 8 MB)
     public init(
         subsystem: String = Bundle.main.bundleIdentifier ?? "",
-        since: Date = Date().addingTimeInterval(-3600)
+        since: Date = Date().addingTimeInterval(-3600),
+        limits: OSLogCollectionLimits = .standard
     ) {
         self.subsystem = subsystem
         self.since = since
+        self.limits = limits
     }
 
     /// Export OSLog as string.
+    ///
+    /// Contains the newest entries within `limits`; the header states how many
+    /// older entries were omitted.
     public func export() async -> String {
 #if canImport(OSLog)
-        let logMessages = await getLog()
+        let collection = collect()
 
         let appName: String = {
             if let displayName: String = Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String {
@@ -51,18 +60,24 @@ public class OSLogExtractor {
             return "this application"
         }()
 
-        return [
-            "This is the OSLog archive for \(appName).\r\n",
-            "Generated on \(Date().formatted())\r\n",
-            "Generator https://github.com/0xWDG/OSLogViewer\r\n\r\n",
-            logMessages.map {
-                "\($0.composedMessage)\r\n" +
-                getLogLevelEmoji(level: $0.level) +
-                " \($0.date.formatted()) 🏛️ \($0.sender) ⚙️ \($0.subsystem) 🌐 \($0.category)"
-            }
-                .joined(separator: "\r\n\r\n")
-        ]
-            .joined()
+        var output = "This is the OSLog archive for \(appName).\r\n"
+        output += "Generated on \(Date().formatted())\r\n"
+        output += "Generator https://github.com/0xWDG/OSLogViewer\r\n"
+        if collection.omittedCount > 0 {
+            output += "Omitted \(collection.omittedCount) older entries "
+            output += "(limit \(limits.maxEntries) entries / \(limits.maxBytes / 1024) KB)\r\n"
+        }
+        output += "\r\n"
+        output.reserveCapacity(output.utf8.count + collection.entries.reduce(0) { $0 + OSLogCollection.cost(of: $1) })
+
+        for (index, entry) in collection.entries.enumerated() {
+            if index > 0 { output += "\r\n\r\n" }
+            output += entry.composedMessage
+            output += "\r\n"
+            output += getLogLevelEmoji(level: entry.level)
+            output += " \(entry.date.formatted()) 🏛️ \(entry.sender) ⚙️ \(entry.subsystem) 🌐 \(entry.category)"
+        }
+        return output
 #else
         return ""
 #endif
@@ -90,34 +105,24 @@ public class OSLogExtractor {
     }
 
     /// Get the logs
+    ///
+    /// Returns the newest entries within `limits`, oldest first.
     public func getLog() async -> [OSLogEntryLog] {
+        collect().entries
+    }
+
+    private func collect() -> OSLogCollection {
         do {
-            /// Initialize logstore for the current proces
-            let logStore = try OSLogStore(scope: .currentProcessIdentifier)
-
-            /// Fetch all logs since a specific date
-            let sinceDate = logStore.position(date: self.since)
-
-            /// Predicate (filter) all results to have the subsystem starting with the given subsystem
-            let predicate = NSPredicate(
-                format: "subsystem BEGINSWITH %@",
-                self.subsystem
+            return try OSLogCollection.collect(
+                since: since,
+                matching: NSPredicate(format: "subsystem BEGINSWITH %@", subsystem),
+                limits: limits
             )
-
-            /// Get all logs from the log store
-            return try logStore.getEntries(
-                at: sinceDate,
-                matching: predicate
-            ).compactMap {
-                // Remap from `AnySequence<OSLogEntry>` to type `[OSLogEntryLog]`
-                $0 as? OSLogEntryLog
-            }
-
         } catch {
             // We fail to get the results, add this to the log.
             os_log(.fault, "Something went wrong %@", error as NSError)
 
-            return []
+            return .empty
         }
     }
 #endif
