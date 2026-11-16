@@ -52,6 +52,9 @@ public struct OSLogViewer: View {
     /// How much history is kept; older entries beyond these limits are omitted
     private let limits: OSLogCollectionLimits
 
+    /// Extra lines written at the top of the exported file, after the title line
+    private let exportHeaderLines: [String]
+
     @State
     /// Number of older entries dropped to stay within `limits`
     private var omittedCount: Int = 0
@@ -72,15 +75,19 @@ public struct OSLogViewer: View {
     ///   - additionalSubsystems: any other subsystems to pre-select
     ///   - since: from which time (standard 1hr)
     ///   - limits: how much history is kept (standard 20,000 entries / 8 MB)
+    ///   - exportHeaderLines: extra lines written at the top of the exported file,
+    ///     such as the app version, build number or environment
     public init(
         subsystem: String = Bundle.main.bundleIdentifier ?? "",
         additionalSubsystems: Set<String> = [],
         since: Date = Date().addingTimeInterval(-3600),
-        limits: OSLogCollectionLimits = .standard
+        limits: OSLogCollectionLimits = .standard,
+        exportHeaderLines: [String] = []
     ) {
         self.subsystem = subsystem
         self.since = since
         self.limits = limits
+        self.exportHeaderLines = exportHeaderLines
 
         var combinedSubsystems = additionalSubsystems
         if !subsystem.isEmpty {
@@ -101,17 +108,19 @@ public struct OSLogViewer: View {
     public init(
         subsystems: Set<String>,
         since: Date = Date().addingTimeInterval(-3600),
-        limits: OSLogCollectionLimits = .standard
+        limits: OSLogCollectionLimits = .standard,
+        exportHeaderLines: [String] = []
     ) {
         if let first = subsystems.first {
             self.init(
                 subsystem: first,
                 additionalSubsystems: subsystems.subtracting(Set([first])),
                 since: since,
-                limits: limits
+                limits: limits,
+                exportHeaderLines: exportHeaderLines
             )
         } else {
-            self.init(subsystem: "", since: since, limits: limits)
+            self.init(subsystem: "", since: since, limits: limits, exportHeaderLines: exportHeaderLines)
         }
     }
 
@@ -618,8 +627,9 @@ public struct OSLogViewer: View {
 
         let appName = resolvedAppName()
         let fileName = exportFileName(for: appName)
-        var headerLines = [
-            "OSLog archive for \(appName)",
+        var headerLines = ["OSLog archive for \(appName)"]
+        headerLines += exportHeaderLines
+        headerLines += [
             "Generated on \(Date().formatted(date: .long, time: .standard))",
             filterSummaryDescription(),
             "Logs captured since \(since.formatted(date: .abbreviated, time: .shortened))"

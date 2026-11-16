@@ -27,20 +27,27 @@ public class OSLogExtractor {
     /// How much history is kept; older entries beyond these limits are omitted
     public var limits: OSLogCollectionLimits
 
+    /// Extra lines written at the top of the export, after the title line
+    public var exportHeaderLines: [String]
+
     /// OSLogExtractor is made to extract your apps OS_Log history,
     ///
     /// - Parameters:
     ///   - subsystem: which subsystem should be read
     ///   - since: from which time (standard 1hr)
     ///   - limits: how much history is kept (standard 20,000 entries / 8 MB)
+    ///   - exportHeaderLines: extra lines written at the top of the export,
+    ///     such as the app version, build number or environment
     public init(
         subsystem: String = Bundle.main.bundleIdentifier ?? "",
         since: Date = Date().addingTimeInterval(-3600),
-        limits: OSLogCollectionLimits = .standard
+        limits: OSLogCollectionLimits = .standard,
+        exportHeaderLines: [String] = []
     ) {
         self.subsystem = subsystem
         self.since = since
         self.limits = limits
+        self.exportHeaderLines = exportHeaderLines
     }
 
     /// Export OSLog as string.
@@ -51,23 +58,7 @@ public class OSLogExtractor {
 #if canImport(OSLog)
         let collection = collect()
 
-        let appName: String = {
-            if let displayName: String = Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String {
-                return displayName
-            } else if let name: String = Bundle.main.infoDictionary?["CFBundleName"] as? String {
-                return name
-            }
-            return "this application"
-        }()
-
-        var output = "This is the OSLog archive for \(appName).\r\n"
-        output += "Generated on \(Date().formatted())\r\n"
-        output += "Generator https://github.com/0xWDG/OSLogViewer\r\n"
-        if collection.omittedCount > 0 {
-            output += "Omitted \(collection.omittedCount) older entries "
-            output += "(limit \(limits.maxEntries) entries / \(limits.maxBytes / 1024) KB)\r\n"
-        }
-        output += "\r\n"
+        var output = header(omittedCount: collection.omittedCount)
         output.reserveCapacity(output.utf8.count + collection.entries.reduce(0) { $0 + OSLogCollection.cost(of: $1) })
 
         for (index, entry) in collection.entries.enumerated() {
@@ -81,6 +72,31 @@ public class OSLogExtractor {
 #else
         return ""
 #endif
+    }
+
+    /// Header written above the exported entries, ending with a blank line.
+    func header(omittedCount: Int, generatedOn date: Date = Date()) -> String {
+        let appName: String = {
+            if let displayName: String = Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String {
+                return displayName
+            } else if let name: String = Bundle.main.infoDictionary?["CFBundleName"] as? String {
+                return name
+            }
+            return "this application"
+        }()
+
+        var output = "This is the OSLog archive for \(appName).\r\n"
+        for line in exportHeaderLines {
+            output += "\(line)\r\n"
+        }
+        output += "Generated on \(date.formatted())\r\n"
+        output += "Generator https://github.com/0xWDG/OSLogViewer\r\n"
+        if omittedCount > 0 {
+            output += "Omitted \(omittedCount) older entries "
+            output += "(limit \(limits.maxEntries) entries / \(limits.maxBytes / 1024) KB)\r\n"
+        }
+        output += "\r\n"
+        return output
     }
 
 #if canImport(OSLog)
